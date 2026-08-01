@@ -1,0 +1,31 @@
+{
+  "name": "openai-schema",
+  "version": "1.0.0",
+  "description": "Mutable schema-driven OpenAI Responses API calls for TypeScript",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./openaiSchema": {
+      "types": "./dist/openaiSchema.d.ts",
+      "import": "./dist/openaiSchema.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "node -e \"require('fs').rmSync('.test',{recursive:true,force:true})\" && tsc -p tsconfig.test.json && node --test .test/test/openaiSchema.test.js",
+    "ci": "npm run check && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
