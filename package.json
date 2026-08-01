@@ -22,8 +22,8 @@
   "scripts": {
     "check": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.build.json",
-    "test": "tsc -p tsconfig.test.json && node --test .test/test/openaiSchema.test.js",
-    "ci": "npm run check && npm run test"
+    "test": "node -e \"require('fs').rmSync('.test',{recursive:true,force:true})\" && tsc -p tsconfig.test.json && node --test .test/test/openaiSchema.test.js",
+    "ci": "npm run check && npm run test && npm run build"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

@@ -7,7 +7,7 @@ It owns schema attachment, JSON extraction, optional conversation IDs, retries a
 ## Use
 
 ```ts
-import { OpenAISchema, object, shape, string } from "openai-schema";
+import { OpenAISchema, array, object, shape, string } from "openai-schema";
 
 interface Reply {
   text: string;
