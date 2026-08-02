@@ -71,6 +71,60 @@ test("can remain stateless and leaves model settings to the caller", async () =>
   assert.equal(calls[0]?.conversation, undefined);
 });
 
+test("normalises generic input for the Responses API", async () => {
+  const inputs: unknown[] = [];
+  const fetcher: Fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as Dict;
+    inputs.push(body.input);
+    return response({ output_text: JSON.stringify({ text: "ok" }) });
+  };
+
+  const client = new OpenAISchema("secret", out, undefined, {
+    fetch: fetcher,
+    conversation: false,
+  });
+
+  await client.send({ topic: "astrology", count: 2 }, { body: { model: "model-b" } });
+  await client.send([{ role: "user", content: "hello" }], { body: { model: "model-b" } });
+  await client.send(42, { body: { model: "model-b" } });
+
+  assert.deepEqual(inputs, [
+    JSON.stringify({ topic: "astrology", count: 2 }),
+    [{ role: "user", content: "hello" }],
+    "42",
+  ]);
+});
+
+test("rejects input that cannot be represented by the Responses API", async () => {
+  let calls = 0;
+  const fetcher: Fetch = async () => {
+    calls += 1;
+    return response({ output_text: JSON.stringify({ text: "unreachable" }) });
+  };
+
+  const client = new OpenAISchema("secret", out, undefined, {
+    fetch: fetcher,
+    conversation: false,
+  });
+
+  const circular: { self?: unknown } = {};
+  circular.self = circular;
+
+  let caught: unknown;
+  try {
+    await client.send(circular, { body: { model: "model-b" } });
+  } catch (error: unknown) {
+    caught = error;
+  }
+
+  assert.equal(caught instanceof TypeError, true);
+  assert.equal(
+    caught instanceof Error ? caught.message : "",
+    "OpenAI input must be a string, an array of input items, or JSON-serialisable",
+  );
+  assert.equal(calls, 0);
+});
+
 test("mutates T with updateSchema", async () => {
   const fetcher: Fetch = async () => response({ output_text: JSON.stringify({ items: ["a", "b"] }) });
   const client = new OpenAISchema("secret", out, undefined, { fetch: fetcher, conversation: false });
@@ -108,7 +162,7 @@ test("run changes schema and request atomically", async () => {
   assert.deepEqual(names, ["first", "second"]);
 });
 
-test("retries parsing and permits generic input replacement", async () => {
+test("retries parsing and normalises generic input replacement", async () => {
   let count = 0;
   const inputs: unknown[] = [];
   const fetcher: Fetch = async (_input, init) => {
@@ -121,13 +175,16 @@ test("retries parsing and permits generic input replacement", async () => {
   };
 
   const client = new OpenAISchema("secret", out, undefined, { fetch: fetcher, conversation: false });
-  const value = await client.send("first", {
+  const value = await client.send({ attempt: "first" }, {
     body: { model: "model-e" },
     retries: 1,
     retryDelayMs: 0,
-    onRetry: () => "second",
+    onRetry: () => ({ attempt: "second" }),
   });
 
   assert.equal(value.text, "fixed");
-  assert.deepEqual(inputs, ["first", "second"]);
+  assert.deepEqual(inputs, [
+    JSON.stringify({ attempt: "first" }),
+    JSON.stringify({ attempt: "second" }),
+  ]);
 });

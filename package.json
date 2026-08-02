@@ -1,6 +1,6 @@
 {
   "name": "openai-schema",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Mutable schema-driven OpenAI Responses API calls for TypeScript",
   "type": "module",
   "license": "MIT",

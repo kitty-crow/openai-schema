@@ -34,6 +34,8 @@ const out = await ai.send(
 
 `OpenAISchema` creates an OpenAI conversation lazily and exposes its ID through `id`. Pass `{ conversation: false }` for stateless calls, or pass an existing conversation ID as the third constructor argument.
 
+Responses API input may be supplied as a string or an array of input items. Other JSON-serialisable values are encoded as JSON strings before transmission, including values returned by `onRetry`.
+
 ## Mutable output types
 
 ```ts
