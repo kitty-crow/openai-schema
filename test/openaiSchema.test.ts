@@ -110,9 +110,17 @@ test("rejects input that cannot be represented by the Responses API", async () =
   const circular: { self?: unknown } = {};
   circular.self = circular;
 
-  await assert.rejects(
-    client.send(circular, { body: { model: "model-b" } }),
-    /OpenAI input must be a string, an array of input items, or JSON-serialisable/u,
+  let caught: unknown;
+  try {
+    await client.send(circular, { body: { model: "model-b" } });
+  } catch (error: unknown) {
+    caught = error;
+  }
+
+  assert.equal(caught instanceof TypeError, true);
+  assert.equal(
+    caught instanceof Error ? caught.message : "",
+    "OpenAI input must be a string, an array of input items, or JSON-serialisable",
   );
   assert.equal(calls, 0);
 });
