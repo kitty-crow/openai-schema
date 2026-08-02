@@ -108,6 +108,20 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function responseInput(value: unknown): string | unknown[] {
+  if (typeof value === "string" || Array.isArray(value)) return value;
+
+  try {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) throw new TypeError();
+    return encoded;
+  } catch {
+    throw new TypeError(
+      "OpenAI input must be a string, an array of input items, or JSON-serialisable",
+    );
+  }
+}
+
 export class OpenAISchema<T extends object> {
   private readonly apiKey: string;
   private readonly fetcher: Fetch;
@@ -247,7 +261,7 @@ export class OpenAISchema<T extends object> {
       const existingText = rec(opts.body.text) ? opts.body.text : {};
       const body: Dict = {
         ...opts.body,
-        input: currentInput,
+        input: responseInput(currentInput),
         text: {
           ...existingText,
           format: {
