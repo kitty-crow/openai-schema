@@ -76,13 +76,13 @@ function rec(value: unknown): value is Dict {
 
 function text(value: unknown): string | null {
   if (!rec(value)) return null;
-  if (typeof value.output_text === "string") return value.output_text;
-  if (!Array.isArray(value.output)) return null;
+  if (typeof value["output_text"] === "string") return value["output_text"];
+  if (!Array.isArray(value["output"])) return null;
 
-  for (const item of value.output) {
-    if (!rec(item) || !Array.isArray(item.content)) continue;
-    for (const part of item.content) {
-      if (rec(part) && typeof part.text === "string") return part.text;
+  for (const item of value["output"]) {
+    if (!rec(item) || !Array.isArray(item["content"])) continue;
+    for (const part of item["content"]) {
+      if (rec(part) && typeof part["text"] === "string") return part["text"];
     }
   }
   return null;
@@ -98,7 +98,7 @@ function safeName(name: string): string {
 }
 
 function asShape<T extends object>(def: ShapeDef<T>, name = "DynamicSchema"): Shape<T> {
-  if (rec(def) && typeof def.name === "string" && rec(def.schema)) {
+  if (rec(def) && typeof def["name"] === "string" && rec(def["schema"])) {
     return def as unknown as Shape<T>;
   }
   return { name: safeName(name), schema: def as Schema };
@@ -241,10 +241,10 @@ export class OpenAISchema<T extends object> {
 
     if (!response.ok) throw new OpenAIError(response.status, await response.text());
     const value: unknown = await response.json();
-    if (!rec(value) || typeof value.id !== "string" || !value.id) {
+    if (!rec(value) || typeof value["id"] !== "string" || !value["id"]) {
       throw new OutputError("OpenAI did not return a conversation id", "", 1);
     }
-    this.conversationId = value.id;
+    this.conversationId = value["id"];
   }
 
   private async call<U extends object>(shape: Shape<U>, input: unknown, opts: Send): Promise<U> {
@@ -258,7 +258,7 @@ export class OpenAISchema<T extends object> {
     let last = "Structured output was unavailable";
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const existingText = rec(opts.body.text) ? opts.body.text : {};
+      const existingText = rec(opts.body["text"]) ? opts.body["text"] : {};
       const body: Dict = {
         ...opts.body,
         input: responseInput(currentInput),
@@ -275,7 +275,7 @@ export class OpenAISchema<T extends object> {
       };
 
       if (this.managedConversation && this.conversationId) {
-        body.conversation = { id: this.conversationId };
+        body["conversation"] = { id: this.conversationId };
       }
 
       const response = await this.fetcher(`${this.base}/responses`, {
