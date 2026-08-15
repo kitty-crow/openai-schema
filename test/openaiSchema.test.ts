@@ -158,6 +158,106 @@ test("exposes usage from every Responses API result", async () => {
   assert.deepEqual(client.lastUsage, seen[1]);
 });
 
+test("rolls over a managed conversation after a genuine context-window failure", async () => {
+  const calls: Array<{ url: string; method: string; body?: Dict }> = [];
+  let responseCalls = 0;
+  const fetcher: Fetch = async (input, init) => {
+    const url = String(input);
+    const method = String(init?.method ?? "GET");
+    const body = init?.body === undefined ? undefined : JSON.parse(String(init.body)) as Dict;
+    calls.push({ url, method, ...(body === undefined ? {} : { body }) });
+
+    if (url.includes("/conversations/conv_old/items?")) {
+      return response({
+        object: "list",
+        data: [
+          { type: "message", role: "user", content: "old question" },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "old answer" }] },
+        ],
+        first_id: "item_1",
+        last_id: "item_2",
+        has_more: false,
+      });
+    }
+    if (url.endsWith("/responses/compact")) {
+      return response({
+        id: "cmp_1",
+        object: "response.compaction",
+        output: [
+          { type: "message", role: "user", content: "old question" },
+          { type: "compaction", id: "cmp_item", encrypted_content: "opaque" },
+        ],
+        usage: { input_tokens: 400, output_tokens: 20, total_tokens: 420 },
+      });
+    }
+    if (url.endsWith("/conversations")) return response({ id: "conv_new" });
+    if (url.endsWith("/responses")) {
+      responseCalls += 1;
+      if (responseCalls === 1) {
+        return response({
+          error: {
+            code: "context_length_exceeded",
+            message: "Maximum context length exceeded",
+          },
+        }, 400);
+      }
+      return response({
+        id: "resp_new",
+        output_text: JSON.stringify({ text: "recovered" }),
+        usage: { input_tokens: 90, output_tokens: 5, total_tokens: 95 },
+      });
+    }
+    return response({ error: { message: "unexpected" } }, 500);
+  };
+
+  const seen: Usage[] = [];
+  const client = new OpenAISchema("secret", out, "conv_old", { fetch: fetcher });
+  const value = await client.send("new turn", {
+    body: { model: "model-a", instructions: "Keep continuity." },
+    compaction: true,
+    onUsage: stats => seen.push(stats),
+  });
+
+  assert.equal(value.text, "recovered");
+  assert.equal(client.id, "conv_new");
+  assert.deepEqual(seen, [
+    { inputTokens: 400, outputTokens: 20, totalTokens: 420, cachedTokens: 0, reasoningTokens: 0 },
+    { inputTokens: 90, outputTokens: 5, totalTokens: 95, cachedTokens: 0, reasoningTokens: 0 },
+  ]);
+
+  const compact = calls.find(call => call.url.endsWith("/responses/compact"));
+  assert.equal(compact?.body?.model, "model-a");
+  assert.equal(compact?.body?.instructions, "Keep continuity.");
+
+  const retried = calls.filter(call => call.url.endsWith("/responses"))[1];
+  assert.deepEqual(retried?.body?.conversation, { id: "conv_new" });
+  assert.deepEqual(retried?.body?.input, [
+    { type: "compaction", id: "cmp_item", encrypted_content: "opaque" },
+    { role: "user", content: "new turn" },
+  ]);
+});
+
+test("does not rollover on unrelated HTTP 400 errors", async () => {
+  const urls: string[] = [];
+  const fetcher: Fetch = async (input) => {
+    urls.push(String(input));
+    return response({ error: { code: "invalid_request_error", message: "Schema is invalid" } }, 400);
+  };
+
+  const client = new OpenAISchema("secret", out, "conv_old", { fetch: fetcher });
+  let caught: unknown;
+  try {
+    await client.send("prompt", { body: { model: "model-a" }, compaction: true });
+  } catch (error: unknown) {
+    caught = error;
+  }
+
+  assert.equal(caught instanceof Error, true);
+  assert.equal(urls.length, 1);
+  assert.equal(urls[0]?.endsWith("/responses"), true);
+  assert.equal(client.id, "conv_old");
+});
+
 test("normalises generic input for the Responses API", async () => {
   const inputs: unknown[] = [];
   const fetcher: Fetch = async (_input, init) => {
