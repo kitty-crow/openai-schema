@@ -21,12 +21,22 @@ export interface Retry {
   readonly input: unknown;
 }
 
+export interface Usage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly cachedTokens: number;
+  readonly reasoningTokens: number;
+}
+
 export interface Send {
   readonly body: Dict & { model: string };
   readonly signal?: AbortSignal;
   readonly retries?: number;
   readonly retryDelayMs?: number;
+  readonly compaction?: boolean;
   readonly onRetry?: (info: Retry) => unknown | void | Promise<unknown | void>;
+  readonly onUsage?: (usage: Usage) => unknown | void | Promise<unknown | void>;
 }
 
 export type ToolFn = (params: Dict) => unknown | Promise<unknown>;
@@ -88,6 +98,30 @@ function text(value: unknown): string | null {
   return null;
 }
 
+function usage(value: unknown): Usage | undefined {
+  if (!rec(value) || !rec(value["usage"])) return undefined;
+  const raw = value["usage"];
+  const input = raw["input_tokens"];
+  const output = raw["output_tokens"];
+  const total = raw["total_tokens"];
+  if (typeof input !== "number" || typeof output !== "number" || typeof total !== "number") {
+    return undefined;
+  }
+
+  const inputDetails = rec(raw["input_tokens_details"]) ? raw["input_tokens_details"] : {};
+  const outputDetails = rec(raw["output_tokens_details"]) ? raw["output_tokens_details"] : {};
+  const cached = inputDetails["cached_tokens"];
+  const reasoning = outputDetails["reasoning_tokens"];
+
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    totalTokens: total,
+    cachedTokens: typeof cached === "number" ? cached : 0,
+    reasoningTokens: typeof reasoning === "number" ? reasoning : 0,
+  };
+}
+
 function pause(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -130,6 +164,7 @@ export class OpenAISchema<T extends object> {
   private readonly managedConversation: boolean;
   private current: Shape<object>;
   private conversationId: string | undefined;
+  private responseUsage: Usage | undefined;
   private tools: Record<string, Tool> = {};
   private tail: Promise<void> = Promise.resolve();
   private busyCount = 0;
@@ -156,6 +191,10 @@ export class OpenAISchema<T extends object> {
 
   public get id(): string | undefined {
     return this.conversationId;
+  }
+
+  public get lastUsage(): Usage | undefined {
+    return this.responseUsage;
   }
 
   public get isBusy(): boolean {
@@ -274,6 +313,10 @@ export class OpenAISchema<T extends object> {
         },
       };
 
+      if (opts.compaction === true && body["context_management"] === undefined) {
+        body["context_management"] = [{ type: "compaction" }];
+      }
+
       if (this.managedConversation && this.conversationId) {
         body["conversation"] = { id: this.conversationId };
       }
@@ -287,6 +330,10 @@ export class OpenAISchema<T extends object> {
 
       if (!response.ok) throw new OpenAIError(response.status, await response.text());
       const value: unknown = await response.json();
+      this.responseUsage = usage(value);
+      if (this.responseUsage !== undefined && opts.onUsage) {
+        await opts.onUsage(this.responseUsage);
+      }
       raw = text(value) ?? "";
 
       try {
