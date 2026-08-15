@@ -59,7 +59,9 @@ When `compaction: true` is present and the caller has not already supplied `body
 
 OpenAI then manages server-side compaction for the Responses call. Omitting `compaction`, or setting it to `false`, adds nothing and preserves the legacy request shape. A caller that needs lower-level control may still provide its own `body.context_management`, including a `compact_threshold`; the wrapper leaves that value untouched.
 
-Response token usage is normalised into `Usage`. `lastUsage` exposes the most recent Responses result, and optional `onUsage` receives usage from each Responses result, including retry attempts:
+For managed conversations, opt-in compaction also provides a last-resort rollover path. If the Responses API still returns a recognised context-window HTTP 400, the wrapper retrieves the existing conversation items, sends the relevant state to `/responses/compact`, creates a fresh managed conversation, seeds the retry with the returned opaque compaction item plus the current input, and changes `id` only after that retry succeeds. Unrelated HTTP 400 errors do not trigger rollover. If compaction or rollover itself fails, the original context-window error is preserved.
+
+Response token usage is normalised into `Usage`. `lastUsage` exposes the most recent Responses or compaction result, and optional `onUsage` receives usage from each successful API result, including retry and fallback-compaction calls:
 
 ```ts
 await ai.send(input, {
@@ -107,8 +109,8 @@ The wrapper never needs to know the application's interface in advance. A `Shape
 - `lastUsage` returns the most recent normalised Responses token usage when supplied by OpenAI.
 - `isBusy` and `queued` expose queue state.
 - `registerTool()` retains generic tool metadata for hosts that use it.
-- `compaction: true` opts one `send()`/`run()` call into server-side Responses compaction.
-- `onUsage` observes usage from each Responses result without changing the returned structured output.
+- `compaction: true` opts one `send()`/`run()` call into server-side Responses compaction and managed-conversation rollover recovery.
+- `onUsage` observes usage from each successful Responses or compaction result without changing the returned structured output.
 
 The package has no OpenAI SDK dependency. It uses `fetch`, so it works in modern Node.js, Bun, workers and other Web API runtimes.
 
