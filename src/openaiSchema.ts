@@ -21,12 +21,22 @@ export interface Retry {
   readonly input: unknown;
 }
 
+export interface Usage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly cachedTokens: number;
+  readonly reasoningTokens: number;
+}
+
 export interface Send {
   readonly body: Dict & { model: string };
   readonly signal?: AbortSignal;
   readonly retries?: number;
   readonly retryDelayMs?: number;
+  readonly compaction?: boolean;
   readonly onRetry?: (info: Retry) => unknown | void | Promise<unknown | void>;
+  readonly onUsage?: (usage: Usage) => unknown | void | Promise<unknown | void>;
 }
 
 export type ToolFn = (params: Dict) => unknown | Promise<unknown>;
@@ -88,6 +98,30 @@ function text(value: unknown): string | null {
   return null;
 }
 
+function usage(value: unknown): Usage | undefined {
+  if (!rec(value) || !rec(value["usage"])) return undefined;
+  const raw = value["usage"];
+  const input = raw["input_tokens"];
+  const output = raw["output_tokens"];
+  const total = raw["total_tokens"];
+  if (typeof input !== "number" || typeof output !== "number" || typeof total !== "number") {
+    return undefined;
+  }
+
+  const inputDetails = rec(raw["input_tokens_details"]) ? raw["input_tokens_details"] : {};
+  const outputDetails = rec(raw["output_tokens_details"]) ? raw["output_tokens_details"] : {};
+  const cached = inputDetails["cached_tokens"];
+  const reasoning = outputDetails["reasoning_tokens"];
+
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    totalTokens: total,
+    cachedTokens: typeof cached === "number" ? cached : 0,
+    reasoningTokens: typeof reasoning === "number" ? reasoning : 0,
+  };
+}
+
 function pause(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -122,6 +156,30 @@ function responseInput(value: unknown): string | unknown[] {
   }
 }
 
+function inputItems(value: unknown): unknown[] {
+  const input = responseInput(value);
+  return Array.isArray(input) ? input : [{ role: "user", content: input }];
+}
+
+function contextExceeded(status: number, body: string): boolean {
+  if (status !== 400) return false;
+  const lower = body.toLowerCase();
+  return lower.includes("context_length_exceeded")
+    || lower.includes("maximum context length")
+    || lower.includes("context window")
+    || lower.includes("input exceeds the model's context")
+    || lower.includes("input size will exceed");
+}
+
+function sinceCompaction(items: unknown[]): unknown[] {
+  let last = -1;
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (rec(item) && item["type"] === "compaction") last = index;
+  }
+  return last < 0 ? items : items.slice(last);
+}
+
 export class OpenAISchema<T extends object> {
   private readonly apiKey: string;
   private readonly fetcher: Fetch;
@@ -130,6 +188,7 @@ export class OpenAISchema<T extends object> {
   private readonly managedConversation: boolean;
   private current: Shape<object>;
   private conversationId: string | undefined;
+  private responseUsage: Usage | undefined;
   private tools: Record<string, Tool> = {};
   private tail: Promise<void> = Promise.resolve();
   private busyCount = 0;
@@ -156,6 +215,10 @@ export class OpenAISchema<T extends object> {
 
   public get id(): string | undefined {
     return this.conversationId;
+  }
+
+  public get lastUsage(): Usage | undefined {
+    return this.responseUsage;
   }
 
   public get isBusy(): boolean {
@@ -230,9 +293,7 @@ export class OpenAISchema<T extends object> {
     };
   }
 
-  private async initConversation(): Promise<void> {
-    if (!this.managedConversation || this.conversationId) return;
-
+  private async createConversation(): Promise<string> {
     const response = await this.fetcher(`${this.base}/conversations`, {
       method: "POST",
       headers: this.headersFor(),
@@ -244,7 +305,89 @@ export class OpenAISchema<T extends object> {
     if (!rec(value) || typeof value["id"] !== "string" || !value["id"]) {
       throw new OutputError("OpenAI did not return a conversation id", "", 1);
     }
-    this.conversationId = value["id"];
+    return value["id"];
+  }
+
+  private async initConversation(): Promise<void> {
+    if (!this.managedConversation || this.conversationId) return;
+    this.conversationId = await this.createConversation();
+  }
+
+  private async conversationItems(id: string, signal?: AbortSignal): Promise<unknown[]> {
+    const items: unknown[] = [];
+    let after: string | undefined;
+
+    while (true) {
+      const query = new URLSearchParams({ limit: "100", order: "asc" });
+      if (after !== undefined) query.set("after", after);
+      const response = await this.fetcher(
+        `${this.base}/conversations/${encodeURIComponent(id)}/items?${query.toString()}`,
+        {
+          method: "GET",
+          headers: this.headersFor(),
+          ...(signal === undefined ? {} : { signal }),
+        },
+      );
+      if (!response.ok) throw new OpenAIError(response.status, await response.text());
+
+      const value: unknown = await response.json();
+      if (!rec(value) || !Array.isArray(value["data"])) {
+        throw new OutputError("OpenAI did not return conversation items", "", 1);
+      }
+      items.push(...value["data"]);
+      if (value["has_more"] !== true) return items;
+
+      const next = value["last_id"];
+      if (typeof next !== "string" || !next || next === after) {
+        throw new OutputError("OpenAI returned an invalid conversation-items cursor", "", 1);
+      }
+      after = next;
+    }
+  }
+
+  private async rollover(input: unknown, opts: Send): Promise<{ id: string; input: unknown[] }> {
+    const oldId = this.conversationId;
+    if (!this.managedConversation || oldId === undefined) {
+      throw new OutputError("Managed conversation rollover is unavailable", "", 1);
+    }
+
+    const items = sinceCompaction(await this.conversationItems(oldId, opts.signal));
+    const compactBody: Dict = {
+      model: opts.body.model,
+      input: items,
+    };
+    if (typeof opts.body["instructions"] === "string") {
+      compactBody["instructions"] = opts.body["instructions"];
+    }
+
+    const response = await this.fetcher(`${this.base}/responses/compact`, {
+      method: "POST",
+      headers: this.headersFor(),
+      body: JSON.stringify(compactBody),
+      ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+    });
+    if (!response.ok) throw new OpenAIError(response.status, await response.text());
+
+    const value: unknown = await response.json();
+    this.responseUsage = usage(value);
+    if (this.responseUsage !== undefined && opts.onUsage) {
+      await opts.onUsage(this.responseUsage);
+    }
+    if (!rec(value) || !Array.isArray(value["output"])) {
+      throw new OutputError("OpenAI did not return compacted conversation state", "", 1);
+    }
+
+    const compact = [...value["output"]].reverse().find(
+      item => rec(item) && item["type"] === "compaction",
+    );
+    if (compact === undefined) {
+      throw new OutputError("OpenAI compaction returned no compaction item", "", 1);
+    }
+
+    return {
+      id: await this.createConversation(),
+      input: [compact, ...inputItems(input)],
+    };
   }
 
   private async call<U extends object>(shape: Shape<U>, input: unknown, opts: Send): Promise<U> {
@@ -274,19 +417,62 @@ export class OpenAISchema<T extends object> {
         },
       };
 
+      if (opts.compaction === true && body["context_management"] === undefined) {
+        body["context_management"] = [{ type: "compaction" }];
+      }
+
       if (this.managedConversation && this.conversationId) {
         body["conversation"] = { id: this.conversationId };
       }
 
-      const response = await this.fetcher(`${this.base}/responses`, {
-        method: "POST",
-        headers: this.headersFor(),
-        body: JSON.stringify(body),
-        ...(opts.signal === undefined ? {} : { signal: opts.signal }),
-      });
+      let requestBody = body;
+      let rolledId: string | undefined;
+      let rolled = false;
+      let value: unknown;
 
-      if (!response.ok) throw new OpenAIError(response.status, await response.text());
-      const value: unknown = await response.json();
+      while (true) {
+        const response = await this.fetcher(`${this.base}/responses`, {
+          method: "POST",
+          headers: this.headersFor(),
+          body: JSON.stringify(requestBody),
+          ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+        });
+
+        if (!response.ok) {
+          const errorBody = await response.text();
+          if (
+            !rolled
+            && opts.compaction === true
+            && this.managedConversation
+            && this.conversationId !== undefined
+            && contextExceeded(response.status, errorBody)
+          ) {
+            try {
+              const recovery = await this.rollover(currentInput, opts);
+              requestBody = {
+                ...body,
+                input: recovery.input,
+                conversation: { id: recovery.id },
+              };
+              rolledId = recovery.id;
+              rolled = true;
+              continue;
+            } catch {
+              throw new OpenAIError(response.status, errorBody);
+            }
+          }
+          throw new OpenAIError(response.status, errorBody);
+        }
+
+        value = await response.json();
+        if (rolledId !== undefined) this.conversationId = rolledId;
+        break;
+      }
+
+      this.responseUsage = usage(value);
+      if (this.responseUsage !== undefined && opts.onUsage) {
+        await opts.onUsage(this.responseUsage);
+      }
       raw = text(value) ?? "";
 
       try {
