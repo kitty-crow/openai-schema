@@ -8,6 +8,7 @@ import {
   string,
   type Dict,
   type Fetch,
+  type Usage,
 } from "../src/openaiSchema.js";
 
 type Out = { text: string };
@@ -69,6 +70,92 @@ test("can remain stateless and leaves model settings to the caller", async () =>
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.model, "model-b");
   assert.equal(calls[0]?.conversation, undefined);
+});
+
+test("compaction is request-level opt-in and false preserves legacy requests", async () => {
+  const calls: Dict[] = [];
+  const fetcher: Fetch = async (_input, init) => {
+    calls.push(JSON.parse(String(init?.body)) as Dict);
+    return response({ output_text: JSON.stringify({ text: "ok" }) });
+  };
+
+  const client = new OpenAISchema("secret", out, undefined, {
+    fetch: fetcher,
+    conversation: false,
+  });
+
+  await client.send("legacy", { body: { model: "model-b" } });
+  await client.send("explicit-off", { body: { model: "model-b" }, compaction: false });
+  await client.send("on", { body: { model: "model-b" }, compaction: true });
+  await client.send("caller-configured", {
+    body: {
+      model: "model-b",
+      context_management: [{ type: "compaction", compact_threshold: 1234 }],
+    },
+    compaction: true,
+  });
+
+  assert.equal(calls[0]?.context_management, undefined);
+  assert.equal(calls[1]?.context_management, undefined);
+  assert.deepEqual(calls[2]?.context_management, [{ type: "compaction" }]);
+  assert.deepEqual(calls[3]?.context_management, [{ type: "compaction", compact_threshold: 1234 }]);
+});
+
+test("exposes usage from every Responses API result", async () => {
+  const seen: Usage[] = [];
+  let count = 0;
+  const fetcher: Fetch = async () => {
+    count += 1;
+    return count === 1
+      ? response({
+          output_text: "not json",
+          usage: {
+            input_tokens: 100,
+            output_tokens: 5,
+            total_tokens: 105,
+            input_tokens_details: { cached_tokens: 80 },
+            output_tokens_details: { reasoning_tokens: 2 },
+          },
+        })
+      : response({
+          output_text: JSON.stringify({ text: "fixed" }),
+          usage: {
+            input_tokens: 120,
+            output_tokens: 8,
+            total_tokens: 128,
+          },
+        });
+  };
+
+  const client = new OpenAISchema("secret", out, undefined, {
+    fetch: fetcher,
+    conversation: false,
+  });
+  const value = await client.send("prompt", {
+    body: { model: "model-b" },
+    retries: 1,
+    retryDelayMs: 0,
+    onUsage: stats => seen.push(stats),
+  });
+
+  assert.equal(value.text, "fixed");
+  assert.deepEqual(seen, [
+    {
+      inputTokens: 100,
+      outputTokens: 5,
+      totalTokens: 105,
+      cachedTokens: 80,
+      reasoningTokens: 2,
+    },
+    {
+      inputTokens: 120,
+      outputTokens: 8,
+      totalTokens: 128,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+    },
+  ]);
+  assert.deepEqual(client.lastUsage, seen[1]);
 });
 
 test("normalises generic input for the Responses API", async () => {
